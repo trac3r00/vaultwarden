@@ -3,7 +3,7 @@ use num_traits::FromPrimitive;
 use rocket::{
     Route,
     form::{Form, FromForm},
-    http::{Cookie, CookieJar, SameSite},
+    http::{Accept, Cookie, CookieJar, MediaType, SameSite},
     response::Redirect,
     serde::json::Json,
 };
@@ -22,7 +22,7 @@ use crate::{
             },
         },
         master_password_policy,
-        push::register_push_device,
+        push::{login_after_push_registration, register_push_device},
     },
     auth,
     auth::{AuthMethod, ClientHeaders, ClientIp, ClientVersion, Secure, generate_organization_api_key_login_claims},
@@ -30,7 +30,7 @@ use crate::{
     db::{
         DbConn,
         models::{
-            AuthRequest, AuthRequestId, Device, DeviceId, EventType, Invitation, OIDCCodeResponseError,
+            AuthRequest, AuthRequestId, Device, DeviceId, DeviceType, EventType, Invitation, OIDCCodeResponseError,
             OrganizationApiKey, OrganizationId, SendId, SsoAuth, SsoUser, TwoFactor, TwoFactorIncomplete,
             TwoFactorType, User, UserId,
         },
@@ -507,6 +507,57 @@ async fn password_login(
     authenticated_response(&user, &mut device, auth_tokens, twofactor_token, conn, ip).await
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NewDeviceEmailMode {
+    Skip,
+    BlockOnFailure,
+    Background,
+}
+
+pub(crate) fn new_device_email_mode(
+    mail_enabled: bool,
+    is_new_device: bool,
+    require_device_email: bool,
+) -> NewDeviceEmailMode {
+    match (mail_enabled, is_new_device, require_device_email) {
+        (false, _, _) | (_, false, _) => NewDeviceEmailMode::Skip,
+        (true, true, true) => NewDeviceEmailMode::BlockOnFailure,
+        (true, true, false) => NewDeviceEmailMode::Background,
+    }
+}
+
+async fn send_new_device_email(user: &User, device: &Device, ip: &ClientIp) -> EmptyResult {
+    let device_type = DeviceType::from_i32(device.atype);
+    match new_device_email_mode(CONFIG.mail_enabled(), device.is_new(), CONFIG.require_device_email()) {
+        NewDeviceEmailMode::Skip => Ok(()),
+        NewDeviceEmailMode::BlockOnFailure => {
+            let now = Utc::now().naive_utc();
+            if let Err(e) =
+                mail::send_new_device_logged_in(&user.email, &ip.ip.to_string(), &now, &device.name, device_type).await
+            {
+                error!("Error sending new device email: {e:#?}");
+                err!(
+                    "Could not send login notification email. Please contact your administrator.",
+                    ErrorEvent {
+                        event: EventType::UserFailedLogIn
+                    }
+                )
+            }
+            Ok(())
+        }
+        NewDeviceEmailMode::Background => {
+            let now = Utc::now().naive_utc();
+            let (address, ip, device_name) = (user.email.clone(), ip.ip.to_string(), device.name.clone());
+            tokio::task::spawn(async move {
+                if let Err(e) = mail::send_new_device_logged_in(&address, &ip, &now, &device_name, device_type).await {
+                    error!("Error sending new device email: {e:#?}");
+                }
+            });
+            Ok(())
+        }
+    }
+}
+
 async fn authenticated_response(
     user: &User,
     device: &mut Device,
@@ -515,25 +566,11 @@ async fn authenticated_response(
     conn: &DbConn,
     ip: &ClientIp,
 ) -> JsonResult {
-    if CONFIG.mail_enabled() && device.is_new() {
-        let now = Utc::now().naive_utc();
-        if let Err(e) = mail::send_new_device_logged_in(&user.email, &ip.ip.to_string(), &now, device).await {
-            error!("Error sending new device email: {e:#?}");
-
-            if CONFIG.require_device_email() {
-                err!(
-                    "Could not send login notification email. Please contact your administrator.",
-                    ErrorEvent {
-                        event: EventType::UserFailedLogIn
-                    }
-                )
-            }
-        }
-    }
+    send_new_device_email(user, device, ip).await?;
 
     // register push device
     if !device.is_new() {
-        register_push_device(device, conn).await?;
+        login_after_push_registration(register_push_device(device, conn).await)?;
     }
 
     // Save to update `device.updated_at` to track usage and toggle new status
@@ -663,21 +700,7 @@ async fn user_api_key_login(
 
     let mut device = get_device(&data, conn, &user).await?;
 
-    if CONFIG.mail_enabled() && device.is_new() {
-        let now = Utc::now().naive_utc();
-        if let Err(e) = mail::send_new_device_logged_in(&user.email, &ip.ip.to_string(), &now, &device).await {
-            error!("Error sending new device email: {e:#?}");
-
-            if CONFIG.require_device_email() {
-                err!(
-                    "Could not send login notification email. Please contact your administrator.",
-                    ErrorEvent {
-                        event: EventType::UserFailedLogIn
-                    }
-                )
-            }
-        }
-    }
+    send_new_device_email(&user, &device, ip).await?;
 
     // ---
     // Disabled this variable, it was used to generate the JWT
@@ -1083,11 +1106,19 @@ enum RegisterVerificationResponse {
     #[response(status = 204)]
     NoContent(()),
     Token(Json<String>),
+    PlainToken(String),
+}
+
+/// iOS sends `Accept: */*` and treats the raw body as the JWT (#7712 / #7714).
+/// JSON `"eyJ..."` makes the quotes part of the token. Default stays JSON.
+fn accepts_json(accept: Option<&Accept>) -> bool {
+    accept.is_none_or(|accept| accept.preferred().media_type() != &MediaType::Any)
 }
 
 #[post("/accounts/register/send-verification-email", data = "<data>")]
 async fn register_verification_email(
     data: Json<RegisterVerificationData>,
+    accept: Option<&Accept>,
     ip: ClientIp,
     conn: DbConn,
 ) -> ApiResult<RegisterVerificationResponse> {
@@ -1125,7 +1156,11 @@ async fn register_verification_email(
     } else {
         // If email verification is not required, return the token directly
         // the clients will use this token to finish the registration
-        Ok(RegisterVerificationResponse::Token(Json(token)))
+        Ok(if accepts_json(accept) {
+            RegisterVerificationResponse::Token(Json(token))
+        } else {
+            RegisterVerificationResponse::PlainToken(token)
+        })
     }
 }
 
@@ -1355,4 +1390,43 @@ async fn authorize(data: AuthorizeData, cookies: &CookieJar<'_>, secure: Secure,
     );
 
     Ok(Redirect::temporary(String::from(auth_url)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rocket::http::Accept;
+
+    #[test]
+    fn ios_star_accept_is_plain_registration_token() {
+        let accept: Accept = "*/*".parse().expect("parse Accept */*");
+        assert!(!accepts_json(Some(&accept)), "iOS Accept: */* must get a raw JWT, not JSON quotes (#7714)");
+    }
+
+    #[test]
+    fn missing_accept_keeps_json_registration_token() {
+        assert!(accepts_json(None));
+    }
+
+    #[test]
+    fn json_accept_keeps_json_registration_token() {
+        let accept: Accept = "application/json".parse().expect("parse Accept json");
+        assert!(accepts_json(Some(&accept)));
+    }
+
+    #[test]
+    fn new_device_email_is_background_by_default() {
+        assert_eq!(new_device_email_mode(true, true, false), NewDeviceEmailMode::Background);
+    }
+
+    #[test]
+    fn new_device_email_blocks_when_required() {
+        assert_eq!(new_device_email_mode(true, true, true), NewDeviceEmailMode::BlockOnFailure);
+    }
+
+    #[test]
+    fn new_device_email_skips_existing_device_and_disabled_mail() {
+        assert_eq!(new_device_email_mode(true, false, false), NewDeviceEmailMode::Skip);
+        assert_eq!(new_device_email_mode(false, true, true), NewDeviceEmailMode::Skip);
+    }
 }
