@@ -525,6 +525,10 @@ pub async fn update_cipher_from_data(
         err!("Data missing")
     };
 
+    if data.r#type == 5 {
+        crate::db::models::cipher_json::validate_ssh_key_data(&type_data)?;
+    }
+
     cipher.key = data.key;
     cipher.name = data.name;
     cipher.notes = data.notes;
