@@ -92,7 +92,22 @@ async fn send_email_login(data: Json<SendEmailLoginData>, client_headers: Client
                 err!("AuthRequest doesn't exist", "Invalid device, IP or code")
             }
         } else {
-            err!("No password hash has been submitted.")
+            if !allow_email_2fa_send_without_secret(data.device_identifier.is_some()) {
+                err!("No password hash has been submitted.")
+            }
+            let Some(device_identifier) = &data.device_identifier else {
+                err!("No password hash has been submitted.")
+            };
+            match User::find_by_device_for_email2fa(device_identifier, &conn).await {
+                Some(device_user) if device_user.email.eq_ignore_ascii_case(email) => {}
+                Some(_) => {
+                    err!(
+                        "Username or password is incorrect. Try again",
+                        format!("IP: {}. Username: {email}.", client_headers.ip.ip)
+                    )
+                }
+                None => err!("No password hash has been submitted."),
+            }
         }
 
         user
@@ -112,6 +127,14 @@ async fn send_email_login(data: Json<SendEmailLoginData>, client_headers: Client
     };
 
     send_token(&user.uuid, &conn).await
+}
+
+/// iOS 2026.7+ may POST `/two-factor/send-email-login` with email and no
+/// `masterPasswordHash` after a 2FA-required token response (#7568).
+/// Only allow that when a device identifier is present so the send is bound
+/// to an existing device, matching the SSO path.
+pub(crate) fn allow_email_2fa_send_without_secret(has_device_identifier: bool) -> bool {
+    has_device_identifier
 }
 
 /// Generate the token, save the data for later verification and send email to user
@@ -418,5 +441,18 @@ mod tests {
 
         // If it's smaller than 3 characters it should only show asterisks.
         assert_eq!(result, "***@example.ext");
+    }
+
+    #[test]
+    fn ios_email_2fa_without_hash_is_allowed_when_device_id_present() {
+        assert!(
+            allow_email_2fa_send_without_secret(true),
+            "iOS send-email-login with a device identifier must send the 2FA mail (#7568)"
+        );
+    }
+
+    #[test]
+    fn email_2fa_without_hash_or_device_is_rejected() {
+        assert!(!allow_email_2fa_send_without_secret(false));
     }
 }
