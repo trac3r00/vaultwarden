@@ -29,13 +29,13 @@ use crate::{
     error::Error,
     http_client::make_http_request,
     mail,
-    util::{FeatureFlagFilter, parse_experimental_client_feature_flags},
+    util::{FeatureFlagFilter, parse_experimental_client_feature_flags, with_default_client_feature_states},
 };
 
 pub fn routes() -> Vec<Route> {
     let mut eq_domains_routes = routes![get_settings_domains, post_settings_domains, put_settings_domains];
     let mut hibp_routes = routes![hibp_breach];
-    let mut meta_routes = routes![alive, now, version, config, get_api_webauthn];
+    let mut meta_routes = routes![alive, now, version, config, get_api_webauthn, post_api_webauthn];
 
     let mut routes = Vec::new();
     routes.append(&mut accounts::routes());
@@ -197,14 +197,22 @@ fn version() -> Json<&'static str> {
 
 #[get("/webauthn")]
 fn get_api_webauthn(_headers: Headers) -> Json<Value> {
-    // Prevent a 404 error, which also causes key-rotation issues
-    // It looks like this is used when login with passkeys is enabled, which Vaultwarden does not (yet) support
-    // An empty list/data also works fine
-    Json(json!({
+    // Login-with-passkey is not implemented. An empty list prevents 404s that
+    // also break key-rotation. POST is rejected explicitly instead of 404.
+    Json(webauthn_login_list())
+}
+
+#[post("/webauthn")]
+fn post_api_webauthn(_headers: Headers) -> JsonResult {
+    err!("Passkey login is not supported")
+}
+
+pub(crate) fn webauthn_login_list() -> Value {
+    json!({
         "object": "list",
         "data": [],
         "continuationToken": null
-    }))
+    })
 }
 
 #[get("/config")]
@@ -215,11 +223,10 @@ fn config() -> Json<Value> {
     // Client (v2026.2.1): https://github.com/bitwarden/clients/blob/f96380c3138291a028bdd2c7a5fee540d5c98ba5/libs/common/src/enums/feature-flag.enum.ts#L12
     // Android (v2026.2.1): https://github.com/bitwarden/android/blob/6902c19c0093fa476bbf74ccaa70c9f14afbb82f/core/src/main/kotlin/com/bitwarden/core/data/manager/model/FlagKey.kt#L31
     // iOS (v2026.2.1): https://github.com/bitwarden/ios/blob/cdd9ba1770ca2ffc098d02d12cc3208e3a830454/BitwardenShared/Core/Platform/Models/Enum/FeatureFlag.swift#L7
-    let mut feature_states = parse_experimental_client_feature_flags(
+    let feature_states = with_default_client_feature_states(parse_experimental_client_feature_flags(
         &CONFIG.experimental_client_feature_flags(),
         &FeatureFlagFilter::ValidOnly,
-    );
-    feature_states.insert("pm-19148-innovation-archive".to_owned(), true);
+    ));
 
     Json(json!({
         // Note: The clients use this version to handle backwards compatibility concerns
@@ -240,14 +247,7 @@ fn config() -> Json<Value> {
             // (post-login welcome dialogs, extension install prompts, setup extension redirects, and premium upsell modals) should be suppressed
             "suppressOnboardingInterstitials": CONFIG.client_suppress_onboarding(),
         },
-        "environment": {
-          "vault": domain,
-          "api": format!("{domain}/api"),
-          "identity": format!("{domain}/identity"),
-          "notifications": format!("{domain}/notifications"),
-          "sso": "",
-          "cloudRegion": null,
-        },
+        "environment": config_environment_json(&domain),
         // Bitwarden uses this for the self-hosted servers to indicate the default push technology
         "push": {
           "pushTechnology": 0,
@@ -260,6 +260,39 @@ fn config() -> Json<Value> {
         "communication": null,
         "object": "config",
     }))
+}
+
+pub(crate) fn config_environment_json(domain: &str) -> Value {
+    json!({
+        "vault": domain,
+        "api": format!("{domain}/api"),
+        "identity": format!("{domain}/identity"),
+        "notifications": format!("{domain}/notifications"),
+        "sso": "",
+        "cloudRegion": null,
+        "fillAssistRules": null,
+    })
+}
+
+#[cfg(test)]
+mod config_contract_tests {
+    use super::*;
+
+    #[test]
+    fn environment_includes_fill_assist_rules_null() {
+        let env = config_environment_json("https://vault.example");
+        assert!(env["fillAssistRules"].is_null());
+        assert_eq!(env["vault"], "https://vault.example");
+        assert_eq!(env["api"], "https://vault.example/api");
+    }
+
+    #[test]
+    fn webauthn_login_list_is_empty_paged_list() {
+        let v = webauthn_login_list();
+        assert_eq!(v["object"], "list");
+        assert_eq!(v["data"], json!([]));
+        assert!(v["continuationToken"].is_null());
+    }
 }
 
 pub fn catchers() -> Vec<Catcher> {
