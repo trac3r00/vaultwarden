@@ -5,6 +5,7 @@ mod identity;
 mod notifications;
 mod push;
 mod web;
+mod web_well_known;
 
 use rocket::serde::json::Json;
 use serde_json::Value;
@@ -30,7 +31,9 @@ pub use crate::api::{
     },
     web::catchers as web_catchers,
     web::routes as web_routes,
+    web::well_known_routes,
     web::{invalidate_css_cache, static_files},
+    web_well_known::should_mount_origin_root_well_known,
 };
 use crate::{
     CONFIG,
