@@ -25,20 +25,26 @@ use crate::{
     util::{Cached, EtagCached},
 };
 
+use super::web_well_known::{apple_app_site_association_body, webauthn_related_origins_body};
+
 pub fn routes() -> Vec<Route> {
     // If adding more routes here, consider also adding them to
     // crate::utils::LOGGED_ROUTES to make sure they appear in the log
-    let mut routes = routes![attachments, alive, alive_head, static_files];
+    // AASA / app-id / related-origins are needed for mobile passkeys even when
+    // the bundled web vault is disabled. Apple still fetches origin-root
+    // `/.well-known/...`; a non-empty DOMAIN path requires the reverse proxy
+    // to map those URLs to this server.
+    let mut routes = routes![
+        attachments,
+        alive,
+        alive_head,
+        static_files,
+        app_id,
+        apple_app_site_association,
+        webauthn_related_origins,
+    ];
     if CONFIG.web_vault_enabled() {
-        routes.append(&mut routes![
-            web_index,
-            web_index_direct,
-            web_index_head,
-            app_id,
-            apple_app_site_association,
-            web_files,
-            vaultwarden_css
-        ]);
+        routes.append(&mut routes![web_index, web_index_direct, web_index_head, web_files, vaultwarden_css]);
     }
 
     #[cfg(debug_assertions)]
@@ -47,6 +53,12 @@ pub fn routes() -> Vec<Route> {
     }
 
     routes
+}
+
+/// Origin-root `/.well-known/*` for Apple AASA and related-origins.
+/// Mounted at `/` when DOMAIN has a path prefix so Apple can fetch without `/vw`.
+pub fn well_known_routes() -> Vec<Route> {
+    routes![apple_app_site_association, webauthn_related_origins]
 }
 
 pub fn catchers() -> Vec<Catcher> {
@@ -206,20 +218,12 @@ fn app_id() -> Cached<(ContentType, Json<Value>)> {
 
 #[get("/.well-known/apple-app-site-association")]
 fn apple_app_site_association() -> Cached<(ContentType, Json<Value>)> {
-    Cached::long(
-        (
-            ContentType::JSON,
-            Json(json!({
-                "webcredentials": {
-                    "apps": [
-                        "LTZ2PFU5D6.com.8bit.bitwarden",
-                        "LTZ2PFU5D6.com.8bit.bitwarden.beta"
-                    ]
-                }
-            })),
-        ),
-        true,
-    )
+    Cached::long((ContentType::JSON, Json(apple_app_site_association_body())), true)
+}
+
+#[get("/.well-known/webauthn")]
+fn webauthn_related_origins() -> Cached<Json<Value>> {
+    Cached::long(Json(webauthn_related_origins_body(&CONFIG.domain_origin())), true)
 }
 
 #[get("/<p..>", rank = 10)] // Only match this if the other routes don't match
