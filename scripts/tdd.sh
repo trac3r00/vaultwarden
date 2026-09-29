@@ -30,6 +30,6 @@ EXECUTED="$(awk '/^test result: / {
 } END { print n + 0 }' "${LOG}")"
 
 if [[ "${EXECUTED}" -eq 0 ]]; then
-  echo "tdd.sh: filter '${FILTER}' matched no tests" >&2
+  echo "tdd.sh: filter '${FILTER}' ran no tests (it matched none, or only #[ignore]d tests)" >&2
   exit 1
 fi
