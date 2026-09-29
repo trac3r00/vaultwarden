@@ -110,6 +110,18 @@ impl Cipher {
                     .insert(format!("Ciphers[{index}].Notes"), serde_json::to_value([&max_note_size_msg]).unwrap());
             }
 
+            // Imports must fail before anything (collections, earlier ciphers) is written.
+            if cipher.r#type == 5 && !cipher.ssh_key.as_ref().is_some_and(super::cipher_json::ssh_key_data_is_complete)
+            {
+                validation_errors.insert(
+                    format!("Ciphers[{index}].SshKey"),
+                    serde_json::to_value([
+                        "SSH key data must contain non-empty privateKey, publicKey and keyFingerprint.",
+                    ])
+                    .unwrap(),
+                );
+            }
+
             // Validate the password history if it contains `null` values and if so, return a warning
             if let Some(Value::Array(password_history)) = &cipher.password_history {
                 for pwh in password_history {

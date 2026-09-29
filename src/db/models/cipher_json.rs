@@ -9,18 +9,20 @@ use crate::{
 /// Same three members `Cipher::to_json` requires for SSH items.
 /// Official Bitwarden rejects null/empty; VW used to 200 then drop `sshKey` on read (#7514).
 pub fn ssh_key_data_is_complete(type_data: &Value) -> bool {
-    ["privateKey", "publicKey", "keyFingerprint"]
-        .iter()
-        .all(|field| type_data[*field].as_str().is_some_and(|s| !s.is_empty()))
+    first_invalid_ssh_key_field(type_data).is_none()
 }
 
 pub fn validate_ssh_key_data(type_data: &Value) -> EmptyResult {
-    for field in ["privateKey", "publicKey", "keyFingerprint"] {
-        if type_data[field].as_str().is_none_or(str::is_empty) {
-            err!(format!("SSH key field '{field}' must be a non-empty string"));
-        }
+    if let Some(field) = first_invalid_ssh_key_field(type_data) {
+        err!(format!("SSH key field '{field}' must be a non-empty string"));
     }
     Ok(())
+}
+
+fn first_invalid_ssh_key_field(type_data: &Value) -> Option<&'static str> {
+    ["privateKey", "publicKey", "keyFingerprint"]
+        .into_iter()
+        .find(|field| type_data[*field].as_str().is_none_or(str::is_empty))
 }
 
 /// Parse stored cipher `data` JSON and apply per-type client compatibility fixes.

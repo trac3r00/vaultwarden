@@ -1894,8 +1894,7 @@ async fn post_org_import(
             &nt,
             UpdateType::None,
         )
-        .await
-        .ok();
+        .await?;
         ciphers.push(cipher.uuid);
     }
 

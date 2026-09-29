@@ -277,7 +277,7 @@ pub struct CipherData {
     secure_note: Option<Value>,
     card: Option<Value>,
     identity: Option<Value>,
-    ssh_key: Option<Value>,
+    pub ssh_key: Option<Value>,
 
     favorite: Option<bool>,
     reprompt: Option<i32>,
@@ -478,6 +478,32 @@ pub async fn update_cipher_from_data(
         err!("Invalid folder", "Folder does not exist or belongs to another user");
     }
 
+    let type_data_opt = match data.r#type {
+        1 => data.login,
+        2 => data.secure_note,
+        3 => data.card,
+        4 => data.identity,
+        5 => data.ssh_key,
+        _ => err!("Invalid type"),
+    };
+
+    let type_data = if let Some(mut data) = type_data_opt {
+        // Remove the 'Response' key from the base object.
+        data.as_object_mut().unwrap().remove("response");
+        // Remove the 'Response' key from every Uri.
+        if data["uris"].is_array() {
+            data["uris"] = clean_cipher_data(data["uris"].clone());
+        }
+        data
+    } else {
+        err!("Data missing")
+    };
+
+    // Validate before any writes below (attachment rotation, cipher save).
+    if data.r#type == 5 {
+        crate::db::models::cipher_json::validate_ssh_key_data(&type_data)?;
+    }
+
     // Modify attachments name and keys when rotating
     if let Some(attachments) = data.attachments2 {
         for (id, attachment) in attachments {
@@ -502,31 +528,6 @@ pub async fn update_cipher_from_data(
 
             saved_att.save(conn).await?;
         }
-    }
-
-    let type_data_opt = match data.r#type {
-        1 => data.login,
-        2 => data.secure_note,
-        3 => data.card,
-        4 => data.identity,
-        5 => data.ssh_key,
-        _ => err!("Invalid type"),
-    };
-
-    let type_data = if let Some(mut data) = type_data_opt {
-        // Remove the 'Response' key from the base object.
-        data.as_object_mut().unwrap().remove("response");
-        // Remove the 'Response' key from every Uri.
-        if data["uris"].is_array() {
-            data["uris"] = clean_cipher_data(data["uris"].clone());
-        }
-        data
-    } else {
-        err!("Data missing")
-    };
-
-    if data.r#type == 5 {
-        crate::db::models::cipher_json::validate_ssh_key_data(&type_data)?;
     }
 
     cipher.key = data.key;

@@ -32,8 +32,16 @@ pub fn normalize_login_type_data(mut data: Value) -> Value {
 
     // Official Bitwarden uses a nullable array. SDK `has_fido2` is
     // `fido2_credentials.is_some()`, so `[]` would mark every login as a passkey.
+    // Non-object entries cannot be credentials; a list with none left is treated as absent.
     let fido2 = match data.get("fido2Credentials") {
-        Some(Value::Array(creds)) => Value::Array(creds.iter().map(normalize_fido2_credential).collect()),
+        Some(Value::Array(creds)) => {
+            let valid: Vec<Value> = creds.iter().filter(|c| c.is_object()).map(normalize_fido2_credential).collect();
+            if valid.is_empty() && !creds.is_empty() {
+                Value::Null
+            } else {
+                Value::Array(valid)
+            }
+        }
         _ => Value::Null,
     };
     data["fido2Credentials"] = fido2;
@@ -159,6 +167,24 @@ mod tests {
             "fido2Credentials": []
         }));
         assert_eq!(out["fido2Credentials"], json!([]));
+    }
+
+    #[test]
+    fn non_object_fido2_entries_are_dropped() {
+        let cases = [
+            ("scalar only", json!([7]), Value::Null),
+            ("null only", json!([null]), Value::Null),
+            ("string and array", json!(["x", []]), Value::Null),
+            (
+                "null beside real credential",
+                json!([null, {"credentialId": "enc-id", "creationDate": "2024-06-07T14:12:36.150Z"}, 7]),
+                json!([{"credentialId": "enc-id", "creationDate": "2024-06-07T14:12:36.150000Z"}]),
+            ),
+        ];
+        for (case, creds, expected) in cases {
+            let out = normalize_login_type_data(json!({ "fido2Credentials": creds }));
+            assert_eq!(out["fido2Credentials"], expected, "case: {case}");
+        }
     }
 
     #[test]
