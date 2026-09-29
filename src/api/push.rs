@@ -135,6 +135,15 @@ pub async fn register_push_device(device: &mut Device, conn: &DbConn) -> EmptyRe
     Ok(())
 }
 
+/// Push registration is best-effort on login. A decode failure from Bitwarden's
+/// push identity endpoint must not turn a successful auth into HTTP 400 (#7371).
+pub fn login_after_push_registration(result: EmptyResult) -> EmptyResult {
+    if let Err(e) = result {
+        error!("An error occurred while registering the device for push notifications: {e}");
+    }
+    Ok(())
+}
+
 pub async fn unregister_push_device(push_id: Option<&PushId>) -> EmptyResult {
     if !CONFIG.push_enabled() || push_id.is_none() {
         return Ok(());
@@ -332,5 +341,26 @@ pub async fn push_auth_response(user_id: &UserId, auth_request_id: &AuthRequestI
             "clientType": null,
             "installationId": null
         })));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::Error;
+
+    #[test]
+    fn unexpected_push_token_does_not_fail_login() {
+        let err =
+            Error::new("Unexpected push token received from bitwarden server: error decoding response body", "decode");
+        assert!(
+            login_after_push_registration(Err(err)).is_ok(),
+            "push identity decode failure must not fail POST /identity/connect/token (#7371)"
+        );
+    }
+
+    #[test]
+    fn successful_push_registration_stays_ok() {
+        assert!(login_after_push_registration(Ok(())).is_ok());
     }
 }
