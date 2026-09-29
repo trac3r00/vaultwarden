@@ -360,7 +360,17 @@ mod tests {
         let res = client.get(path).dispatch();
         assert_eq!(res.status(), Status::Ok, "{path}");
         let body: Value = res.into_json().expect("JSON body");
-        assert!(body["webcredentials"]["apps"].is_array(), "{path}: {body}");
+        // Independent contract value: Bitwarden iOS app, beta, and Autofill extension app IDs.
+        let expected = json!({
+            "webcredentials": {
+                "apps": [
+                    "LTZ2PFU5D6.com.8bit.bitwarden",
+                    "LTZ2PFU5D6.com.8bit.bitwarden.beta",
+                    "LTZ2PFU5D6.com.8bit.bitwarden.autofill"
+                ]
+            }
+        });
+        assert_eq!(body, expected, "{path}");
     }
 
     #[test]
