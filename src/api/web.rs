@@ -4,7 +4,7 @@ use std::{
 };
 
 use rocket::{
-    Catcher, Route,
+    Build, Catcher, Rocket, Route,
     fs::NamedFile,
     http::ContentType,
     response::{Redirect, content::RawCss as Css, content::RawHtml as Html},
@@ -25,20 +25,28 @@ use crate::{
     util::{Cached, EtagCached},
 };
 
+use super::web_well_known::{
+    apple_app_site_association_body, should_mount_origin_root_well_known, webauthn_related_origins_body,
+};
+
 pub fn routes() -> Vec<Route> {
     // If adding more routes here, consider also adding them to
     // crate::utils::LOGGED_ROUTES to make sure they appear in the log
-    let mut routes = routes![attachments, alive, alive_head, static_files];
+    // AASA / app-id / related-origins are needed for mobile passkeys even when
+    // the bundled web vault is disabled. Apple still fetches origin-root
+    // `/.well-known/...`; a non-empty DOMAIN path requires the reverse proxy
+    // to map those URLs to this server.
+    let mut routes = routes![
+        attachments,
+        alive,
+        alive_head,
+        static_files,
+        app_id,
+        apple_app_site_association,
+        webauthn_related_origins,
+    ];
     if CONFIG.web_vault_enabled() {
-        routes.append(&mut routes![
-            web_index,
-            web_index_direct,
-            web_index_head,
-            app_id,
-            apple_app_site_association,
-            web_files,
-            vaultwarden_css
-        ]);
+        routes.append(&mut routes![web_index, web_index_direct, web_index_head, web_files, vaultwarden_css]);
     }
 
     #[cfg(debug_assertions)]
@@ -47,6 +55,23 @@ pub fn routes() -> Vec<Route> {
     }
 
     routes
+}
+
+/// Origin-root `/.well-known/*` for Apple AASA and related-origins.
+/// Mounted at `/` when DOMAIN has a path prefix so Apple can fetch without `/vw`.
+fn well_known_routes() -> Vec<Route> {
+    routes![apple_app_site_association, webauthn_related_origins]
+}
+
+/// Mounts the web routes under `basepath` (the DOMAIN path) and, when that path is
+/// non-empty, the origin-root well-known routes as well. Used by `launch_rocket`.
+pub fn mount_web_routes(rocket: Rocket<Build>, basepath: &str) -> Rocket<Build> {
+    let rocket = rocket.mount([basepath, "/"].concat(), routes());
+    if should_mount_origin_root_well_known(basepath) {
+        rocket.mount("/", well_known_routes())
+    } else {
+        rocket
+    }
 }
 
 pub fn catchers() -> Vec<Catcher> {
@@ -206,20 +231,13 @@ fn app_id() -> Cached<(ContentType, Json<Value>)> {
 
 #[get("/.well-known/apple-app-site-association")]
 fn apple_app_site_association() -> Cached<(ContentType, Json<Value>)> {
-    Cached::long(
-        (
-            ContentType::JSON,
-            Json(json!({
-                "webcredentials": {
-                    "apps": [
-                        "LTZ2PFU5D6.com.8bit.bitwarden",
-                        "LTZ2PFU5D6.com.8bit.bitwarden.beta"
-                    ]
-                }
-            })),
-        ),
-        true,
-    )
+    Cached::long((ContentType::JSON, Json(apple_app_site_association_body())), true)
+}
+
+#[get("/.well-known/webauthn")]
+fn webauthn_related_origins() -> Cached<Json<Value>> {
+    // Derived from DOMAIN, so keep the cache short enough for a DOMAIN change to propagate.
+    Cached::short(Json(webauthn_related_origins_body(&CONFIG.domain_origin())), false)
 }
 
 #[get("/<p..>", rank = 10)] // Only match this if the other routes don't match
@@ -302,5 +320,72 @@ pub fn static_files(filename: &str) -> Result<(ContentType, &'static [u8]), Erro
         "datatables.js" => Ok((ContentType::JavaScript, include_bytes!("../static/scripts/datatables.js"))),
         "datatables.css" => Ok((ContentType::CSS, include_bytes!("../static/scripts/datatables.css"))),
         _ => err!(format!("Static file not found: {filename}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rocket::{http::Status, local::blocking::Client};
+    use serde_json::{Value, json};
+
+    use super::mount_web_routes;
+    use crate::CONFIG;
+
+    /// Builds the web routes exactly as `launch_rocket` does for the given DOMAIN path.
+    /// `Client::untracked` ignites the instance, which fails on colliding routes.
+    fn client_for(basepath: &str) -> Client {
+        let rocket = mount_web_routes(rocket::build(), basepath);
+        for path in ["/.well-known/webauthn", "/.well-known/apple-app-site-association"] {
+            for mounted in [format!("{basepath}{path}"), path.to_owned()] {
+                let count = rocket.routes().filter(|r| r.uri.path() == mounted.as_str()).count();
+                assert_eq!(count, 1, "basepath {basepath:?}: {mounted} mounted {count} times");
+            }
+        }
+        Client::untracked(rocket).expect("valid rocket instance")
+    }
+
+    fn assert_related_origins(client: &Client, path: &str) {
+        let res = client.get(path).dispatch();
+        assert_eq!(res.status(), Status::Ok, "{path}");
+
+        let cache_control = res.headers().get_one("Cache-Control").expect("Cache-Control header").to_owned();
+        assert!(cache_control.contains("max-age=600"), "{path}: {cache_control}");
+        assert!(!cache_control.contains("immutable"), "{path}: {cache_control}");
+
+        let body: Value = res.into_json().expect("JSON body");
+        assert_eq!(body["origins"], json!([CONFIG.domain_origin()]), "{path}");
+    }
+
+    fn assert_aasa(client: &Client, path: &str) {
+        let res = client.get(path).dispatch();
+        assert_eq!(res.status(), Status::Ok, "{path}");
+        let body: Value = res.into_json().expect("JSON body");
+        // Independent contract value: Bitwarden iOS app, beta, and Autofill extension app IDs.
+        let expected = json!({
+            "webcredentials": {
+                "apps": [
+                    "LTZ2PFU5D6.com.8bit.bitwarden",
+                    "LTZ2PFU5D6.com.8bit.bitwarden.beta",
+                    "LTZ2PFU5D6.com.8bit.bitwarden.autofill"
+                ]
+            }
+        });
+        assert_eq!(body, expected, "{path}");
+    }
+
+    #[test]
+    fn well_known_without_domain_path_is_mounted_once_at_root() {
+        let client = client_for("");
+        assert_related_origins(&client, "/.well-known/webauthn");
+        assert_aasa(&client, "/.well-known/apple-app-site-association");
+    }
+
+    #[test]
+    fn well_known_with_domain_path_is_mounted_at_prefix_and_origin_root() {
+        let client = client_for("/vw");
+        for prefix in ["/vw", ""] {
+            assert_related_origins(&client, &format!("{prefix}/.well-known/webauthn"));
+            assert_aasa(&client, &format!("{prefix}/.well-known/apple-app-site-association"));
+        }
     }
 }

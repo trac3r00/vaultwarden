@@ -579,8 +579,7 @@ async fn launch_rocket(pool: db::DbPool, extra_debug: bool) -> Result<(), Error>
 
     // If adding more paths here, consider also adding them to
     // crate::utils::LOGGED_ROUTES to make sure they appear in the log
-    let instance = rocket::custom(config)
-        .mount([basepath, "/"].concat(), api::web_routes())
+    let instance = api::mount_web_routes(rocket::custom(config), basepath)
         .mount([basepath, "/api"].concat(), api::core_routes())
         .mount([basepath, "/admin"].concat(), api::admin_routes())
         .mount([basepath, "/events"].concat(), api::core_events_routes())
