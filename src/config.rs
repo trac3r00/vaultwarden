@@ -606,7 +606,8 @@ make_config! {
         /// considered incomplete, resulting in an email notification. An incomplete 2FA login is one
         /// where the correct master password was provided but the required 2FA step was not completed,
         /// which potentially indicates a master password compromise. Set to 0 to disable this check.
-        /// This setting applies globally to all users.
+        /// Setting it to 0 also stops iOS clients that omit the master password hash from requesting
+        /// an email 2FA code during login. This setting applies globally to all users.
         incomplete_2fa_time_limit: i64, true,   def,    3;
 
         /// Disable icon downloads |> Set to true to disable icon downloading in the internal icon service.
