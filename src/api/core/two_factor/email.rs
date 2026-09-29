@@ -1,4 +1,4 @@
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, NaiveDateTime, TimeDelta, Utc};
 use rocket::{Route, serde::json::Json};
 
 use crate::{
@@ -96,11 +96,16 @@ async fn send_email_login(data: Json<SendEmailLoginData>, client_headers: Client
             }
         } else {
             // iOS 2026.7+ may omit the password hash after a 2FA-required token response (#7568).
-            // Only allow it when this device has a pending 2FA login for this same account.
+            // Only allow it when this device has a pending 2FA login for this same account that is still
+            // within INCOMPLETE_2FA_TIME_LIMIT. Pending logins are not tracked when that limit is 0, so
+            // this flow then keeps requiring the password hash.
             let Some(device_identifier) = &data.device_identifier else {
                 err!("No password hash has been submitted.")
             };
-            if TwoFactorIncomplete::find_by_user_and_device(&user.uuid, device_identifier, &conn).await.is_none() {
+            let pending = TwoFactorIncomplete::find_by_user_and_device(&user.uuid, device_identifier, &conn).await;
+            let now = Utc::now().naive_utc();
+            if !pending.is_some_and(|p| is_pending_login_fresh(&p.login_time, &now, CONFIG.incomplete_2fa_time_limit()))
+            {
                 err!(
                     "Username or password is incorrect. Try again",
                     format!("IP: {}. Username: {email}. Device: {device_identifier}.", client_headers.ip.ip)
@@ -125,6 +130,15 @@ async fn send_email_login(data: Json<SendEmailLoginData>, client_headers: Client
     };
 
     send_token(&user.uuid, &conn).await
+}
+
+/// Same window as `send_incomplete_2fa_notifications`: a pending login stops counting once it is
+/// older than `limit_minutes`, and nothing counts when tracking is disabled (`limit_minutes <= 0`).
+fn is_pending_login_fresh(login_time: &NaiveDateTime, now: &NaiveDateTime, limit_minutes: i64) -> bool {
+    limit_minutes > 0
+        && TimeDelta::try_minutes(limit_minutes)
+            .and_then(|limit| now.checked_sub_signed(limit))
+            .is_some_and(|cutoff| *login_time >= cutoff)
 }
 
 /// Generate the token, save the data for later verification and send email to user
@@ -431,5 +445,37 @@ mod tests {
 
         // If it's smaller than 3 characters it should only show asterisks.
         assert_eq!(result, "***@example.ext");
+    }
+
+    fn at(s: &str) -> NaiveDateTime {
+        NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").unwrap()
+    }
+
+    #[test]
+    fn pending_login_within_limit_is_fresh() {
+        let now = at("2026-09-29 12:00:00");
+        assert!(is_pending_login_fresh(&at("2026-09-29 11:59:00"), &now, 3));
+        assert!(is_pending_login_fresh(&at("2026-09-29 11:57:00"), &now, 3));
+    }
+
+    #[test]
+    fn pending_login_past_limit_is_rejected() {
+        let now = at("2026-09-29 12:00:00");
+        assert!(!is_pending_login_fresh(&at("2026-09-29 11:56:59"), &now, 3));
+        assert!(!is_pending_login_fresh(&at("2026-09-28 12:00:00"), &now, 3));
+    }
+
+    #[test]
+    fn pending_login_is_never_fresh_when_tracking_is_disabled() {
+        let now = at("2026-09-29 12:00:00");
+        assert!(!is_pending_login_fresh(&now, &now, 0));
+        assert!(!is_pending_login_fresh(&now, &now, -1));
+    }
+
+    #[test]
+    fn pending_login_limit_overflow_is_rejected() {
+        let now = at("2026-09-29 12:00:00");
+        assert!(!is_pending_login_fresh(&now, &now, i64::MAX));
+        assert!(!is_pending_login_fresh(&now, &now, 100_000_000_000_000));
     }
 }
