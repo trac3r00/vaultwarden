@@ -97,6 +97,15 @@ impl Cipher {
     }
 
     pub fn validate_cipher_data(cipher_data: &[CipherData]) -> EmptyResult {
+        Self::validate_cipher_data_inner(cipher_data, false)
+    }
+
+    /// Key rotation leaves organization ciphers untouched, so their SSH data must not block it.
+    pub fn validate_rotated_cipher_data(cipher_data: &[CipherData]) -> EmptyResult {
+        Self::validate_cipher_data_inner(cipher_data, true)
+    }
+
+    fn validate_cipher_data_inner(cipher_data: &[CipherData], skip_org_ssh_keys: bool) -> EmptyResult {
         let mut validation_errors = serde_json::Map::new();
         let max_note_size = CONFIG._max_note_size();
         let max_note_size_msg =
@@ -108,6 +117,20 @@ impl Cipher {
             {
                 validation_errors
                     .insert(format!("Ciphers[{index}].Notes"), serde_json::to_value([&max_note_size_msg]).unwrap());
+            }
+
+            // Imports must fail before anything (collections, earlier ciphers) is written.
+            if cipher.r#type == 5
+                && !(skip_org_ssh_keys && cipher.organization_id.is_some())
+                && !cipher.ssh_key.as_ref().is_some_and(super::cipher_json::ssh_key_data_is_complete)
+            {
+                validation_errors.insert(
+                    format!("Ciphers[{index}].SshKey"),
+                    serde_json::to_value([
+                        "SSH key data must contain non-empty privateKey, publicKey and keyFingerprint.",
+                    ])
+                    .unwrap(),
+                );
             }
 
             // Validate the password history if it contains `null` values and if so, return a warning
@@ -153,6 +176,8 @@ impl Cipher {
         conn: &DbConn,
     ) -> Result<Value, crate::Error> {
         use crate::util::{format_date, validate_and_format_date};
+
+        use super::cipher_json::normalize_cipher_type_data;
 
         let mut attachments_json: Value = Value::Null;
         if let Some(cipher_sync_data) = cipher_sync_data {
@@ -252,61 +277,7 @@ impl Cipher {
 
         // Get the type_data or a default to an empty json object '{}'.
         // If not passing an empty object, mobile clients will crash.
-        let mut type_data_json = serde_json::from_str::<LowerCase<Value>>(&self.data)
-            .inspect_err(|_| warn!("Error parsing data field for {}", self.uuid))
-            .map_or_else(|_| Value::Object(serde_json::Map::new()), |d| d.data);
-
-        // NOTE: This was marked as *Backwards Compatibility Code*, but as of January 2021 this is still being used by upstream
-        // Set the first element of the Uris array as Uri, this is needed several (mobile) clients.
-        if self.atype == 1 {
-            // Upstream always has an `uri` key/value
-            type_data_json["uri"] = Value::Null;
-            if let Some(uris) = type_data_json["uris"].as_array_mut()
-                && !uris.is_empty()
-            {
-                // Fix uri match values first, they are only allowed to be a number or null
-                // If it is a string, convert it to an int or null if that fails
-                for uri in &mut *uris {
-                    if uri["match"].is_string() {
-                        let match_value = match uri["match"].as_str().unwrap_or_default().parse::<u8>() {
-                            Ok(n) => json!(n),
-                            _ => Value::Null,
-                        };
-                        uri["match"] = match_value;
-                    }
-                }
-                type_data_json["uri"] = uris[0]["uri"].clone();
-            }
-
-            // Check if `passwordRevisionDate` is a valid date, else convert it
-            if let Some(pw_revision) = type_data_json["passwordRevisionDate"].as_str() {
-                type_data_json["passwordRevisionDate"] = json!(validate_and_format_date(pw_revision));
-            }
-        }
-
-        // Fix secure note issues when data is invalid
-        // This breaks at least the native mobile clients
-        if self.atype == 2 {
-            match type_data_json {
-                Value::Object(ref t) if t.get("type").is_some_and(Value::is_number) => {}
-                _ => {
-                    type_data_json = json!({"type": 0});
-                }
-            }
-        }
-
-        // Fix invalid SSH Entries
-        // This breaks at least the native mobile client if invalid
-        // The only way to fix this is by setting type_data_json to `null`
-        // Opening this ssh-key in the mobile client will probably crash the client, but you can edit, save and afterwards delete it
-        if self.atype == 5
-            && (type_data_json["keyFingerprint"].as_str().is_none_or(str::is_empty)
-                || type_data_json["privateKey"].as_str().is_none_or(str::is_empty)
-                || type_data_json["publicKey"].as_str().is_none_or(str::is_empty))
-        {
-            warn!("Error parsing ssh-key, mandatory fields are invalid for {}", self.uuid);
-            type_data_json = Value::Null;
-        }
+        let type_data_json = normalize_cipher_type_data(self.atype, &self.data, self.uuid.as_ref());
 
         let collection_ids = if let Some(cipher_sync_data) = cipher_sync_data {
             if let Some(cipher_collections) = cipher_sync_data.cipher_collections.get(&self.uuid) {
@@ -1181,3 +1152,27 @@ impl Cipher {
     UuidFromParam,
 )]
 pub struct CipherId(String);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn incomplete_ssh(organization_id: Option<&str>) -> CipherData {
+        serde_json::from_value(json!({
+            "type": 5,
+            "name": "2.n|n|n",
+            "organizationId": organization_id,
+            "sshKey": {"privateKey": "", "publicKey": "pub"},
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn rotation_skips_only_organization_ssh_keys() {
+        let org_id = "7fb74f25-0a31-4a1b-8150-8bca3a9b5577";
+        assert!(Cipher::validate_rotated_cipher_data(&[incomplete_ssh(Some(org_id))]).is_ok());
+        assert!(Cipher::validate_rotated_cipher_data(&[incomplete_ssh(None)]).is_err());
+        assert!(Cipher::validate_cipher_data(&[incomplete_ssh(Some(org_id))]).is_err());
+        assert!(Cipher::validate_cipher_data(&[incomplete_ssh(None)]).is_err());
+    }
+}
