@@ -223,7 +223,8 @@ fn apple_app_site_association() -> Cached<(ContentType, Json<Value>)> {
 
 #[get("/.well-known/webauthn")]
 fn webauthn_related_origins() -> Cached<Json<Value>> {
-    Cached::long(Json(webauthn_related_origins_body(&CONFIG.domain_origin())), true)
+    // Derived from DOMAIN, so keep the cache short enough for a DOMAIN change to propagate.
+    Cached::short(Json(webauthn_related_origins_body(&CONFIG.domain_origin())), false)
 }
 
 #[get("/<p..>", rank = 10)] // Only match this if the other routes don't match
@@ -306,5 +307,33 @@ pub fn static_files(filename: &str) -> Result<(ContentType, &'static [u8]), Erro
         "datatables.js" => Ok((ContentType::JavaScript, include_bytes!("../static/scripts/datatables.js"))),
         "datatables.css" => Ok((ContentType::CSS, include_bytes!("../static/scripts/datatables.css"))),
         _ => err!(format!("Static file not found: {filename}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rocket::{http::Status, local::blocking::Client};
+    use serde_json::{Value, json};
+
+    use super::well_known_routes;
+    use crate::CONFIG;
+
+    #[test]
+    fn webauthn_related_origins_uses_short_revalidating_cache() {
+        // Same dual mount as a DOMAIN with a path prefix: origin root and `/vw`.
+        let rocket = rocket::build().mount("/", well_known_routes()).mount("/vw", well_known_routes());
+        let client = Client::untracked(rocket).expect("valid rocket instance");
+
+        for path in ["/.well-known/webauthn", "/vw/.well-known/webauthn"] {
+            let res = client.get(path).dispatch();
+            assert_eq!(res.status(), Status::Ok, "{path}");
+
+            let cache_control = res.headers().get_one("Cache-Control").expect("Cache-Control header").to_owned();
+            assert!(cache_control.contains("max-age=600"), "{path}: {cache_control}");
+            assert!(!cache_control.contains("immutable"), "{path}: {cache_control}");
+
+            let body: Value = res.into_json().expect("JSON body");
+            assert_eq!(body["origins"], json!([CONFIG.domain_origin()]), "{path}");
+        }
     }
 }
