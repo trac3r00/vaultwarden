@@ -839,6 +839,19 @@ pub fn parse_experimental_client_feature_flags(
         .collect()
 }
 
+/// Feature flags that official Bitwarden cloud enables for compatible clients
+/// even when `EXPERIMENTAL_CLIENT_FEATURE_FLAGS` is empty.
+pub const DEFAULT_ON_CLIENT_FEATURE_FLAGS: &[&str] =
+    &["pm-19148-innovation-archive", "pm-30529-webauthn-related-origins"];
+
+/// Merge admin-enabled experimental flags with Vaultwarden's default-on set.
+pub fn with_default_client_feature_states(mut flags: HashMap<String, bool>) -> HashMap<String, bool> {
+    for flag in DEFAULT_ON_CLIENT_FEATURE_FLAGS {
+        flags.entry((*flag).to_owned()).or_insert(true);
+    }
+    flags
+}
+
 /// TODO: This is extracted from IpAddr::is_global, which is unstable:
 /// https://doc.rust-lang.org/nightly/std/net/enum.IpAddr.html#method.is_global
 /// Remove once https://github.com/rust-lang/rust/issues/27709 is merged
@@ -980,5 +993,43 @@ mod tests {
                 });
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod feature_flag_tests {
+    use super::*;
+
+    #[test]
+    fn default_on_includes_related_origins() {
+        let flags = with_default_client_feature_states(HashMap::new());
+        assert_eq!(flags.get("pm-30529-webauthn-related-origins"), Some(&true));
+        assert_eq!(flags.get("pm-19148-innovation-archive"), Some(&true));
+    }
+
+    #[test]
+    fn experimental_flags_are_preserved() {
+        let mut input = HashMap::new();
+        input.insert("ssh-agent".to_owned(), true);
+        let flags = with_default_client_feature_states(input);
+        assert_eq!(flags.get("ssh-agent"), Some(&true));
+        assert_eq!(flags.get("pm-30529-webauthn-related-origins"), Some(&true));
+    }
+
+    #[test]
+    fn explicit_values_are_not_overridden() {
+        let mut input = HashMap::new();
+        input.insert("pm-30529-webauthn-related-origins".to_owned(), false);
+        let flags = with_default_client_feature_states(input);
+        assert_eq!(flags.get("pm-30529-webauthn-related-origins"), Some(&false));
+    }
+
+    #[test]
+    fn invalid_experimental_flags_stay_filtered() {
+        let parsed =
+            parse_experimental_client_feature_flags("ssh-agent, not-a-real-flag", &FeatureFlagFilter::ValidOnly);
+        let flags = with_default_client_feature_states(parsed);
+        assert_eq!(flags.get("ssh-agent"), Some(&true));
+        assert!(!flags.contains_key("not-a-real-flag"));
     }
 }
