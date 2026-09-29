@@ -203,7 +203,7 @@ fn get_api_webauthn(_headers: Headers) -> Json<Value> {
 }
 
 #[post("/webauthn")]
-fn post_api_webauthn(_headers: Headers) -> JsonResult {
+fn post_api_webauthn() -> JsonResult {
     err!("Passkey login is not supported")
 }
 
@@ -292,6 +292,21 @@ mod config_contract_tests {
         assert_eq!(v["object"], "list");
         assert_eq!(v["data"], json!([]));
         assert!(v["continuationToken"].is_null());
+    }
+
+    #[test]
+    fn webauthn_post_without_bearer_is_unsupported_and_get_still_requires_auth() {
+        use rocket::{http::Status, local::blocking::Client};
+
+        let client =
+            Client::untracked(rocket::build().mount("/api", routes![get_api_webauthn, post_api_webauthn])).unwrap();
+
+        let response = client.post("/api/webauthn").dispatch();
+        assert_eq!(response.status(), Status::BadRequest);
+        let body: Value = response.into_json().unwrap();
+        assert_eq!(body["message"], "Passkey login is not supported");
+
+        assert_eq!(client.get("/api/webauthn").dispatch().status(), Status::Unauthorized);
     }
 }
 
