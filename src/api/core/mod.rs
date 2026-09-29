@@ -35,7 +35,7 @@ use crate::{
 pub fn routes() -> Vec<Route> {
     let mut eq_domains_routes = routes![get_settings_domains, post_settings_domains, put_settings_domains];
     let mut hibp_routes = routes![hibp_breach];
-    let mut meta_routes = routes![alive, now, version, config, get_api_webauthn];
+    let mut meta_routes = routes![alive, now, version, config, get_api_webauthn, post_api_webauthn];
 
     let mut routes = Vec::new();
     routes.append(&mut accounts::routes());
@@ -197,14 +197,22 @@ fn version() -> Json<&'static str> {
 
 #[get("/webauthn")]
 fn get_api_webauthn(_headers: Headers) -> Json<Value> {
-    // Prevent a 404 error, which also causes key-rotation issues
-    // It looks like this is used when login with passkeys is enabled, which Vaultwarden does not (yet) support
-    // An empty list/data also works fine
-    Json(json!({
+    // Login-with-passkey is not implemented. An empty list prevents 404s that
+    // also break key-rotation. POST is rejected explicitly instead of 404.
+    Json(webauthn_login_list())
+}
+
+#[post("/webauthn")]
+fn post_api_webauthn() -> JsonResult {
+    err!("Passkey login is not supported")
+}
+
+pub(crate) fn webauthn_login_list() -> Value {
+    json!({
         "object": "list",
         "data": [],
         "continuationToken": null
-    }))
+    })
 }
 
 #[get("/config")]
@@ -239,14 +247,7 @@ fn config() -> Json<Value> {
             // (post-login welcome dialogs, extension install prompts, setup extension redirects, and premium upsell modals) should be suppressed
             "suppressOnboardingInterstitials": CONFIG.client_suppress_onboarding(),
         },
-        "environment": {
-          "vault": domain,
-          "api": format!("{domain}/api"),
-          "identity": format!("{domain}/identity"),
-          "notifications": format!("{domain}/notifications"),
-          "sso": "",
-          "cloudRegion": null,
-        },
+        "environment": config_environment_json(&domain),
         // Bitwarden uses this for the self-hosted servers to indicate the default push technology
         "push": {
           "pushTechnology": 0,
@@ -259,6 +260,54 @@ fn config() -> Json<Value> {
         "communication": null,
         "object": "config",
     }))
+}
+
+pub(crate) fn config_environment_json(domain: &str) -> Value {
+    json!({
+        "vault": domain,
+        "api": format!("{domain}/api"),
+        "identity": format!("{domain}/identity"),
+        "notifications": format!("{domain}/notifications"),
+        "sso": "",
+        "cloudRegion": null,
+        "fillAssistRules": null,
+    })
+}
+
+#[cfg(test)]
+mod config_contract_tests {
+    use super::*;
+
+    #[test]
+    fn environment_includes_fill_assist_rules_null() {
+        let env = config_environment_json("https://vault.example");
+        assert!(env["fillAssistRules"].is_null());
+        assert_eq!(env["vault"], "https://vault.example");
+        assert_eq!(env["api"], "https://vault.example/api");
+    }
+
+    #[test]
+    fn webauthn_login_list_is_empty_paged_list() {
+        let v = webauthn_login_list();
+        assert_eq!(v["object"], "list");
+        assert_eq!(v["data"], json!([]));
+        assert!(v["continuationToken"].is_null());
+    }
+
+    #[test]
+    fn webauthn_post_without_bearer_is_unsupported_and_get_still_requires_auth() {
+        use rocket::{http::Status, local::blocking::Client};
+
+        let client =
+            Client::untracked(rocket::build().mount("/api", routes![get_api_webauthn, post_api_webauthn])).unwrap();
+
+        let response = client.post("/api/webauthn").dispatch();
+        assert_eq!(response.status(), Status::BadRequest);
+        let body: Value = response.into_json().unwrap();
+        assert_eq!(body["message"], "Passkey login is not supported");
+
+        assert_eq!(client.get("/api/webauthn").dispatch().status(), Status::Unauthorized);
+    }
 }
 
 pub fn catchers() -> Vec<Catcher> {
