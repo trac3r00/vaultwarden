@@ -1015,4 +1015,21 @@ mod feature_flag_tests {
         assert_eq!(flags.get("ssh-agent"), Some(&true));
         assert_eq!(flags.get("pm-30529-webauthn-related-origins"), Some(&true));
     }
+
+    #[test]
+    fn explicit_values_are_not_overridden() {
+        let mut input = HashMap::new();
+        input.insert("pm-30529-webauthn-related-origins".to_owned(), false);
+        let flags = with_default_client_feature_states(input);
+        assert_eq!(flags.get("pm-30529-webauthn-related-origins"), Some(&false));
+    }
+
+    #[test]
+    fn invalid_experimental_flags_stay_filtered() {
+        let parsed =
+            parse_experimental_client_feature_flags("ssh-agent, not-a-real-flag", &FeatureFlagFilter::ValidOnly);
+        let flags = with_default_client_feature_states(parsed);
+        assert_eq!(flags.get("ssh-agent"), Some(&true));
+        assert!(!flags.contains_key("not-a-real-flag"));
+    }
 }

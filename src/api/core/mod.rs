@@ -29,7 +29,7 @@ use crate::{
     error::Error,
     http_client::make_http_request,
     mail,
-    util::{FeatureFlagFilter, parse_experimental_client_feature_flags},
+    util::{FeatureFlagFilter, parse_experimental_client_feature_flags, with_default_client_feature_states},
 };
 
 pub fn routes() -> Vec<Route> {
@@ -215,11 +215,10 @@ fn config() -> Json<Value> {
     // Client (v2026.2.1): https://github.com/bitwarden/clients/blob/f96380c3138291a028bdd2c7a5fee540d5c98ba5/libs/common/src/enums/feature-flag.enum.ts#L12
     // Android (v2026.2.1): https://github.com/bitwarden/android/blob/6902c19c0093fa476bbf74ccaa70c9f14afbb82f/core/src/main/kotlin/com/bitwarden/core/data/manager/model/FlagKey.kt#L31
     // iOS (v2026.2.1): https://github.com/bitwarden/ios/blob/cdd9ba1770ca2ffc098d02d12cc3208e3a830454/BitwardenShared/Core/Platform/Models/Enum/FeatureFlag.swift#L7
-    let mut feature_states = parse_experimental_client_feature_flags(
+    let feature_states = with_default_client_feature_states(parse_experimental_client_feature_flags(
         &CONFIG.experimental_client_feature_flags(),
         &FeatureFlagFilter::ValidOnly,
-    );
-    feature_states.insert("pm-19148-innovation-archive".to_owned(), true);
+    ));
 
     Json(json!({
         // Note: The clients use this version to handle backwards compatibility concerns
@@ -305,4 +304,22 @@ async fn accept_org_invite(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rocket::{http::Status, local::blocking::Client};
+
+    #[test]
+    fn config_route_reports_default_on_feature_states() {
+        let client = Client::untracked(rocket::build().mount("/api", routes![config])).unwrap();
+        let response = client.get("/api/config").dispatch();
+        assert_eq!(response.status(), Status::Ok);
+
+        let body: Value = response.into_json().unwrap();
+        let feature_states = &body["featureStates"];
+        assert_eq!(feature_states["pm-30529-webauthn-related-origins"], json!(true));
+        assert_eq!(feature_states["pm-19148-innovation-archive"], json!(true));
+    }
 }
