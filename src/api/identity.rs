@@ -1109,20 +1109,21 @@ enum RegisterVerificationResponse {
     PlainToken(String),
 }
 
-/// iOS sends `Accept: */*` and treats the raw body as the JWT (#7712 / #7714).
-/// JSON `"eyJ..."` makes the quotes part of the token. Default stays JSON.
-fn accepts_json(accept: Option<&Accept>) -> bool {
-    accept.is_none_or(|accept| accept.preferred().media_type() != &MediaType::Any)
+/// The iOS app sends `Accept: */*` with `Device-Type: 1` and treats the raw body as the JWT (#7712 / #7714).
+/// JSON `"eyJ..."` makes the quotes part of the token. Every other client, including generic `*/*` ones, stays JSON.
+fn accepts_json(accept: Option<&Accept>, device_type: i32) -> bool {
+    !(device_type == DeviceType::Ios as i32
+        && accept.is_some_and(|accept| accept.preferred().media_type() == &MediaType::Any))
 }
 
 #[post("/accounts/register/send-verification-email", data = "<data>")]
 async fn register_verification_email(
     data: Json<RegisterVerificationData>,
     accept: Option<&Accept>,
-    ip: ClientIp,
+    client_headers: ClientHeaders,
     conn: DbConn,
 ) -> ApiResult<RegisterVerificationResponse> {
-    crate::ratelimit::check_limit_unauthenticated(&ip.ip)?;
+    crate::ratelimit::check_limit_unauthenticated(&client_headers.ip.ip)?;
 
     let data = data.into_inner();
 
@@ -1156,7 +1157,7 @@ async fn register_verification_email(
     } else {
         // If email verification is not required, return the token directly
         // the clients will use this token to finish the registration
-        Ok(if accepts_json(accept) {
+        Ok(if accepts_json(accept, client_headers.device_type) {
             RegisterVerificationResponse::Token(Json(token))
         } else {
             RegisterVerificationResponse::PlainToken(token)
@@ -1397,21 +1398,31 @@ mod tests {
     use super::*;
     use rocket::http::Accept;
 
+    const IOS: i32 = DeviceType::Ios as i32;
+
     #[test]
     fn ios_star_accept_is_plain_registration_token() {
         let accept: Accept = "*/*".parse().expect("parse Accept */*");
-        assert!(!accepts_json(Some(&accept)), "iOS Accept: */* must get a raw JWT, not JSON quotes (#7714)");
+        assert!(!accepts_json(Some(&accept), IOS), "iOS Accept: */* must get a raw JWT, not JSON quotes (#7714)");
+    }
+
+    #[test]
+    fn generic_star_accept_keeps_json_registration_token() {
+        let accept: Accept = "*/*".parse().expect("parse Accept */*");
+        assert!(accepts_json(Some(&accept), DeviceType::UnknownBrowser as i32));
+        assert!(accepts_json(Some(&accept), DeviceType::Android as i32));
     }
 
     #[test]
     fn missing_accept_keeps_json_registration_token() {
-        assert!(accepts_json(None));
+        assert!(accepts_json(None, IOS));
+        assert!(accepts_json(None, DeviceType::UnknownBrowser as i32));
     }
 
     #[test]
     fn json_accept_keeps_json_registration_token() {
         let accept: Accept = "application/json".parse().expect("parse Accept json");
-        assert!(accepts_json(Some(&accept)));
+        assert!(accepts_json(Some(&accept), IOS));
     }
 
     #[test]
