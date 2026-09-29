@@ -30,10 +30,7 @@ pub use crate::api::{
         unregister_push_device,
     },
     web::catchers as web_catchers,
-    web::routes as web_routes,
-    web::well_known_routes,
-    web::{invalidate_css_cache, static_files},
-    web_well_known::should_mount_origin_root_well_known,
+    web::{invalidate_css_cache, mount_web_routes, static_files},
 };
 use crate::{
     CONFIG,

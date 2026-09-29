@@ -4,7 +4,7 @@ use std::{
 };
 
 use rocket::{
-    Catcher, Route,
+    Build, Catcher, Rocket, Route,
     fs::NamedFile,
     http::ContentType,
     response::{Redirect, content::RawCss as Css, content::RawHtml as Html},
@@ -25,7 +25,9 @@ use crate::{
     util::{Cached, EtagCached},
 };
 
-use super::web_well_known::{apple_app_site_association_body, webauthn_related_origins_body};
+use super::web_well_known::{
+    apple_app_site_association_body, should_mount_origin_root_well_known, webauthn_related_origins_body,
+};
 
 pub fn routes() -> Vec<Route> {
     // If adding more routes here, consider also adding them to
@@ -57,8 +59,19 @@ pub fn routes() -> Vec<Route> {
 
 /// Origin-root `/.well-known/*` for Apple AASA and related-origins.
 /// Mounted at `/` when DOMAIN has a path prefix so Apple can fetch without `/vw`.
-pub fn well_known_routes() -> Vec<Route> {
+fn well_known_routes() -> Vec<Route> {
     routes![apple_app_site_association, webauthn_related_origins]
+}
+
+/// Mounts the web routes under `basepath` (the DOMAIN path) and, when that path is
+/// non-empty, the origin-root well-known routes as well. Used by `launch_rocket`.
+pub fn mount_web_routes(rocket: Rocket<Build>, basepath: &str) -> Rocket<Build> {
+    let rocket = rocket.mount([basepath, "/"].concat(), routes());
+    if should_mount_origin_root_well_known(basepath) {
+        rocket.mount("/", well_known_routes())
+    } else {
+        rocket
+    }
 }
 
 pub fn catchers() -> Vec<Catcher> {
@@ -315,25 +328,54 @@ mod tests {
     use rocket::{http::Status, local::blocking::Client};
     use serde_json::{Value, json};
 
-    use super::well_known_routes;
+    use super::mount_web_routes;
     use crate::CONFIG;
 
+    /// Builds the web routes exactly as `launch_rocket` does for the given DOMAIN path.
+    /// `Client::untracked` ignites the instance, which fails on colliding routes.
+    fn client_for(basepath: &str) -> Client {
+        let rocket = mount_web_routes(rocket::build(), basepath);
+        for path in ["/.well-known/webauthn", "/.well-known/apple-app-site-association"] {
+            for mounted in [format!("{basepath}{path}"), path.to_owned()] {
+                let count = rocket.routes().filter(|r| r.uri.path() == mounted.as_str()).count();
+                assert_eq!(count, 1, "basepath {basepath:?}: {mounted} mounted {count} times");
+            }
+        }
+        Client::untracked(rocket).expect("valid rocket instance")
+    }
+
+    fn assert_related_origins(client: &Client, path: &str) {
+        let res = client.get(path).dispatch();
+        assert_eq!(res.status(), Status::Ok, "{path}");
+
+        let cache_control = res.headers().get_one("Cache-Control").expect("Cache-Control header").to_owned();
+        assert!(cache_control.contains("max-age=600"), "{path}: {cache_control}");
+        assert!(!cache_control.contains("immutable"), "{path}: {cache_control}");
+
+        let body: Value = res.into_json().expect("JSON body");
+        assert_eq!(body["origins"], json!([CONFIG.domain_origin()]), "{path}");
+    }
+
+    fn assert_aasa(client: &Client, path: &str) {
+        let res = client.get(path).dispatch();
+        assert_eq!(res.status(), Status::Ok, "{path}");
+        let body: Value = res.into_json().expect("JSON body");
+        assert!(body["webcredentials"]["apps"].is_array(), "{path}: {body}");
+    }
+
     #[test]
-    fn webauthn_related_origins_uses_short_revalidating_cache() {
-        // Same dual mount as a DOMAIN with a path prefix: origin root and `/vw`.
-        let rocket = rocket::build().mount("/", well_known_routes()).mount("/vw", well_known_routes());
-        let client = Client::untracked(rocket).expect("valid rocket instance");
+    fn well_known_without_domain_path_is_mounted_once_at_root() {
+        let client = client_for("");
+        assert_related_origins(&client, "/.well-known/webauthn");
+        assert_aasa(&client, "/.well-known/apple-app-site-association");
+    }
 
-        for path in ["/.well-known/webauthn", "/vw/.well-known/webauthn"] {
-            let res = client.get(path).dispatch();
-            assert_eq!(res.status(), Status::Ok, "{path}");
-
-            let cache_control = res.headers().get_one("Cache-Control").expect("Cache-Control header").to_owned();
-            assert!(cache_control.contains("max-age=600"), "{path}: {cache_control}");
-            assert!(!cache_control.contains("immutable"), "{path}: {cache_control}");
-
-            let body: Value = res.into_json().expect("JSON body");
-            assert_eq!(body["origins"], json!([CONFIG.domain_origin()]), "{path}");
+    #[test]
+    fn well_known_with_domain_path_is_mounted_at_prefix_and_origin_root() {
+        let client = client_for("/vw");
+        for prefix in ["/vw", ""] {
+            assert_related_origins(&client, &format!("{prefix}/.well-known/webauthn"));
+            assert_aasa(&client, &format!("{prefix}/.well-known/apple-app-site-association"));
         }
     }
 }
