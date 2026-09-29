@@ -337,6 +337,10 @@ async fn post_ciphers_create(
     // need it here as well to avoid creating an empty cipher in the call to
     // cipher.save() below.
     enforce_personal_ownership_policy(Some(&data.cipher), &headers, &conn).await?;
+    // Same reason: invalid SSH data must be rejected before the placeholder cipher is saved.
+    if data.cipher.r#type == 5 {
+        crate::db::models::cipher_json::validate_ssh_key_data(data.cipher.ssh_key.as_ref().unwrap_or(&Value::Null))?;
+    }
 
     let mut cipher = Cipher::new(data.cipher.r#type, data.cipher.name.clone());
     cipher.user_uuid = Some(headers.user.uuid.clone());
@@ -487,9 +491,11 @@ pub async fn update_cipher_from_data(
         _ => err!("Invalid type"),
     };
 
-    let type_data = if let Some(mut data) = type_data_opt {
+    // Non-object payloads (e.g. `"sshKey": []`) are rejected like missing data instead of panicking.
+    let type_data = if let Some(Value::Object(mut obj)) = type_data_opt {
         // Remove the 'Response' key from the base object.
-        data.as_object_mut().unwrap().remove("response");
+        obj.remove("response");
+        let mut data = Value::Object(obj);
         // Remove the 'Response' key from every Uri.
         if data["uris"].is_array() {
             data["uris"] = clean_cipher_data(data["uris"].clone());

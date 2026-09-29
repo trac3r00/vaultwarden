@@ -916,7 +916,7 @@ async fn post_rotatekey(data: Json<KeyData>, headers: Headers, conn: DbConn, nt:
     // Bitwarden does not process the import if there is one item invalid.
     // Since we check for the size of the encrypted note length, we need to do that here to pre-validate it.
     // TODO: See if we can optimize the whole cipher adding/importing and prevent duplicate code and checks.
-    Cipher::validate_cipher_data(&data.account_data.ciphers)?;
+    Cipher::validate_rotated_cipher_data(&data.account_data.ciphers)?;
 
     let user_id = &headers.user.uuid;
 

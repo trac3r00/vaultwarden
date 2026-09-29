@@ -97,6 +97,15 @@ impl Cipher {
     }
 
     pub fn validate_cipher_data(cipher_data: &[CipherData]) -> EmptyResult {
+        Self::validate_cipher_data_inner(cipher_data, false)
+    }
+
+    /// Key rotation leaves organization ciphers untouched, so their SSH data must not block it.
+    pub fn validate_rotated_cipher_data(cipher_data: &[CipherData]) -> EmptyResult {
+        Self::validate_cipher_data_inner(cipher_data, true)
+    }
+
+    fn validate_cipher_data_inner(cipher_data: &[CipherData], skip_org_ssh_keys: bool) -> EmptyResult {
         let mut validation_errors = serde_json::Map::new();
         let max_note_size = CONFIG._max_note_size();
         let max_note_size_msg =
@@ -111,7 +120,9 @@ impl Cipher {
             }
 
             // Imports must fail before anything (collections, earlier ciphers) is written.
-            if cipher.r#type == 5 && !cipher.ssh_key.as_ref().is_some_and(super::cipher_json::ssh_key_data_is_complete)
+            if cipher.r#type == 5
+                && !(skip_org_ssh_keys && cipher.organization_id.is_some())
+                && !cipher.ssh_key.as_ref().is_some_and(super::cipher_json::ssh_key_data_is_complete)
             {
                 validation_errors.insert(
                     format!("Ciphers[{index}].SshKey"),
@@ -1141,3 +1152,27 @@ impl Cipher {
     UuidFromParam,
 )]
 pub struct CipherId(String);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn incomplete_ssh(organization_id: Option<&str>) -> CipherData {
+        serde_json::from_value(json!({
+            "type": 5,
+            "name": "2.n|n|n",
+            "organizationId": organization_id,
+            "sshKey": {"privateKey": "", "publicKey": "pub"},
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn rotation_skips_only_organization_ssh_keys() {
+        let org_id = "7fb74f25-0a31-4a1b-8150-8bca3a9b5577";
+        assert!(Cipher::validate_rotated_cipher_data(&[incomplete_ssh(Some(org_id))]).is_ok());
+        assert!(Cipher::validate_rotated_cipher_data(&[incomplete_ssh(None)]).is_err());
+        assert!(Cipher::validate_cipher_data(&[incomplete_ssh(Some(org_id))]).is_err());
+        assert!(Cipher::validate_cipher_data(&[incomplete_ssh(None)]).is_err());
+    }
+}
