@@ -8,9 +8,19 @@ data
 .vscode
 .idea
 *.iml
+*~
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
 
 # Environment file
 .env
 
 # Web vault
 web-vault
+
+# Agent session files
+.omo/
